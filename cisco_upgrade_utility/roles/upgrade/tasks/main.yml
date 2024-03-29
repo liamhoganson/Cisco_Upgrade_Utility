@@ -1,0 +1,27 @@
+---
+- name: Run show platform
+  cisco.iosxr.iosxr_command:
+    commands:
+    - sh platform
+  register: show_platform
+
+- name: Parse Device Model
+  set_fact:
+    iosxr_model: "{{ show_platform.stdout[0] | regex_search(regexp, '\\1', multiline=True) | first }}"
+  vars:
+    regexp: '\d+\/\w*\d+\/CPU\d\s+([\w\-_]+)'
+
+- name: Run tasks for ncs540l_x64 images
+  ansible.builtin.include_tasks:
+    file: ncs540l_x64.yml
+  when: iosxr_model in ncs540l_x64_models
+
+- name: Run tasks for ncs540l_aarch64 images
+  ansible.builtin.include_tasks:
+    file: ncs540l_aarch64.yml
+  when: iosxr_model in ncs540l_aarch64_models
+
+- name: Run tasks for ncs540 images
+  ansible.builtin.include_tasks:
+    file: ncs540.yml
+  when: iosxr_model in ncs540_models

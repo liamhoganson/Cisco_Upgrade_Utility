@@ -1,0 +1,162 @@
+---
+- name: Set router model as fact
+  ansible.builtin.set_fact:
+    applicable_model: "{{ ncs540_models }}"
+- debug:
+    var: applicable_model
+
+- name: Set .tar MD5 Checksum as fact
+  ansible.builtin.set_fact:
+    md5sum: [0a6b5257dafa88df2b0ba7751396fcd3]
+
+
+# Checks cisco router model and version
+- name: 1. CHECK ROUTER MODEL
+  cisco.iosxr.iosxr_facts:
+- debug:
+    msg:
+    - "{{ ansible_net_model }}"
+
+- name: 2. CHECK CURRENT VERSION
+  cisco.iosxr.iosxr_facts:
+- debug:
+    msg:
+      - "Current version is {{ ansible_net_version }}"
+
+
+# Added logic to ensure only applicable routers are getting upgraded
+- name: Fail playbook if router model does not match the applicable model
+  ansible.builtin.fail:
+    msg: "Skipping... {{ inventory_hostname }} model does not match applicable model!"
+  when: iosxr_model not in applicable_model
+
+- name: Fail playbook if router Model and Version match ansiible_net_model and ansible_net_version
+  ansible.builtin.fail:
+    msg: "Skipping... {{ inventory_hostname }} is already up to date!"
+  when: iosxr_model in applicable_model and upgrade_ios_version in ansible_net_version
+
+- debug:
+    msg:
+      - "Image is not compliant and will be upgraded"
+  when: iosxr_model in applicable_model and upgrade_ios_version not in ansible_net_version
+
+
+# Transfers .tar package to router via SCP
+- name: 3. Transfer firmware.tar to router
+  cisco.iosxr.command:
+   commands:
+     - command: scp username@server:/NCS540-iosxr-k9-7.9.2.tar /harddisk:/
+       prompt:
+         - "Password:"
+       answer:
+         - "{{ server_password }}"
+
+# Confirm MD5 checksum of .tar to confirm SCP was successful
+- name: Check MD5 checksum of .tar file
+  cisco.iosxr.command:
+    commands:
+      - sh md5 file /harddisk:/NCS540-iosxr-k9-7.9.2.tar
+  register: checksum
+- debug:
+    var: checksum.stdout
+
+# Fails playbook if checksum is corrupt/does not match.
+- name: Fail Playbook if checksum is corrupt.
+  ansible.builtin.fail:
+    msg: Checksum does not match!
+  when: checksum.stdout != md5sum
+
+
+# Backs up all non compliant router configs
+- name: Get Ansible date/time gather_facts
+  setup:
+    filter: "ansible_date_time"
+    gather_subset: "!all"
+- name: Store as fact
+  set_fact:
+    DATE: "{{ ansible_date_time.date }}"
+
+- name: Create Directory "{{ DATE }}"
+  file:
+    path: iosxr_router_backups/{{ DATE }}
+    state: directory
+  run_once: true
+
+
+- name: 4. BACKUP NON-COMPLIANT ROUTER CONFIGURATION
+  cisco.iosxr.iosxr_config:
+    backup: yes
+    backup_options:
+      filename: "{{ inventory_hostname }}.cfg"
+      dir_path: ./iosxr_router_backups/{{ DATE }}
+
+
+# Run Cisco Upgrade Commands
+- name: 5. Add source on router
+  cisco.iosxr.iosxr_command:
+    commands:
+      - install add source /harddisk:/ NCS540-iosxr-k9-7.9.2.tar sync
+  register: add_source_output
+- debug:
+    var: add_source_output.stdout
+
+
+- name: Confirm if source was added or not and get operation number
+  cisco.iosxr.iosxr_command:
+    commands:
+      - show install log | include "Ending operation" | utility egrep -o "[0-9]+$" | utility tail -n 1
+  register: source_output
+- debug:
+    var: source_output.stdout
+
+- name: Set Operation ID as fact
+  set_fact:
+    op_id: "{{ source_output.stdout | join('') }}"
+
+
+- name: 6. Prepare ID
+  cisco.iosxr.iosxr_command:
+    commands:
+      - install prepare id {{ op_id }} sync
+  register: prepare_op_output
+- debug:
+    var: prepare_op_output
+
+- name: 7. Run install activate
+  cisco.iosxr.command:
+    commands:
+      - command: install activate synchronous
+        prompt:
+          - "This install operation will reload the system, continue?"
+        answer:
+          - "yes"
+  register: activate_output
+  when: '"finished successfully" in (prepare_op_output | string)'
+- debug:
+    var: activate_output.stdout_lines
+
+# Waits for Router Reboot
+- name: Pause for reboot
+  ansible.builtin.wait_for_connection:
+    delay: 500
+    timeout: 1500
+
+- name: 8. Runs install commit
+  cisco.iosxr.iosxr_command:
+    commands:
+      - install commit synchronous
+  register: final_output
+- debug:
+    var: final_output.stdout_lines
+
+# Verification
+- name: 9. Confirm upgraded version is current version
+  cisco.iosxr.iosxr_facts:
+- debug:
+    msg:
+      - "Successfully upgraded router {{ inventory_hostname }}"
+  when: ansible_net_version == upgrade_ios_version or ansible_net_version == upgrade_ios_version_two
+- debug:
+    msg:
+      - "IOS image did not upgrade."
+  when: ansible_net_version != upgrade_ios_version and ansible_net_version != upgrade_ios_version_two
